@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PUBG Match Viewer</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/dayjs@1.11.10/dayjs.min.js"></script>
+  <script src="https://unpkg.com/dayjs@1.11.10/plugin/duration.js"></script>
+  <script>dayjs.extend(window.dayjs_plugin_duration)</script>
+  <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Soft shadows and cards */
+    .card { @apply bg-white/90 backdrop-blur rounded-2xl shadow-lg p-6 border border-slate-100; }
+    .title { @apply text-slate-900 font-semibold; }
+    .sub { @apply text-slate-500 text-sm; }
+    .chip { @apply inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs bg-slate-100 text-slate-600; }
+    .badge { @apply inline-flex items-center gap-2 rounded-xl px-3 py-2 bg-slate-800 text-white; }
+    .btn { @apply inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-slate-900 text-white hover:bg-slate-700 transition; }
+    .btn-ghost { @apply inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-white text-slate-700 border hover:bg-slate-50; }
+    .th { @apply text-left text-xs font-semibold text-slate-500 uppercase tracking-wider; }
+    .td { @apply whitespace-nowrap text-slate-800; }
+    .dropzone { @apply relative flex flex-col items-center justify-center gap-3 rounded-2xl border-2 border-dashed border-slate-300 p-8 hover:border-slate-400 transition bg-white; }
+    .dropzone.dragover { @apply border-indigo-400 bg-indigo-50; }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useMemo, useState, useEffect, useRef } = React;
+
+    // ---------- Helpers ----------
+    const fmtNum = (n) => {
+      if (n === null || n === undefined || Number.isNaN(n)) return "";
+      const v = typeof n === 'string' ? Number(n) : n;
+      return isFinite(v) ? v.toLocaleString() : '';
+    };
+    const fmtMeters = (m) => m ? `${Math.round(m)} m` : '';
+    const fmtDistance = (m) => {
+      if (!m && m !== 0) return '';
+      const v = Number(m);
+      return isFinite(v) ? `${Math.round(v)} m` : '';
+    };
+    const fmtTime = (seconds) => {
+      if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return '';
+      const s = Number(seconds);
+      if (!isFinite(s)) return '';
+      const dur = dayjs.duration({ seconds: Math.max(0, Math.floor(s)) });
+      const h = dur.hours();
+      const mm = String(dur.minutes()).padStart(2, '0');
+      const ss = String(dur.seconds()).padStart(2, '0');
+      return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+    };
+
+    const coalesce = (obj, key, d=0) => {
+      const v = obj?.[key];
+      return v === undefined || v === null ? d : v;
+    };
+
+    const readFileAsText = (file) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsText(file, 'utf-8');
+    });
+
+    // Try to find the player array in multiple shapes
+    const extractPlayers = (json) => {
+      if (!json) return [];
+      if (Array.isArray(json.playerInfoList)) return json.playerInfoList;
+      if (Array.isArray(json.players)) return json.players;
+      // Fallback: search any array of objects containing playerName
+      for (const k of Object.keys(json)) {
+        const v = json[k];
+        if (Array.isArray(v) && v.length && typeof v[0] === 'object' && 'playerName' in v[0]) return v;
+      }
+      return [];
+    };
+
+    // ---------- Core aggregations ----------
+    function computeTeamLeaderboard(players) {
+      // Build map per team
+      const map = new Map();
+      players.forEach(p => {
+        const teamId = p.teamId ?? p.teamID ?? p.TeamId ?? p.team_id ?? 0;
+        const teamName = p.teamName || p.TeamName || `Team ${teamId}`;
+        const rank = p.rank ?? p.Rank ?? null; // might be repeated per player
+        const rec = map.get(teamId) || {
+          teamId, teamName,
+          Rank: rank,
+          Team_Kills: 0,
+          Team_Damage: 0,
+          Survival_Secs: [],
+          Longest_Kill_Distance: 0,
+          Players: 0,
+        };
+        rec.Rank = rec.Rank == null ? rank : Math.min(rec.Rank, rank ?? rec.Rank);
+        rec.Team_Kills += Number(coalesce(p, 'killNum', 0));
+        rec.Team_Damage += Number(coalesce(p, 'damage', 0));
+        rec.Survival_Secs.push(Number(coalesce(p, 'survivalTime', 0)));
+        rec.Longest_Kill_Distance = Math.max(rec.Longest_Kill_Distance, Number(coalesce(p, 'maxKillDistance', 0)));
+        rec.Players += 1;
+        map.set(teamId, rec);
+      });
+
+      let rows = Array.from(map.values()).map(r => ({
+        ...r,
+        Avg_Survival_Time: r.Survival_Secs.length ? _.mean(r.Survival_Secs) : 0,
+      }));
+
+      const hasRank = rows.some(r => r.Rank != null && r.Rank !== -1);
+      rows = hasRank
+        ? _.orderBy(rows, ['Rank', 'Team_Kills', 'Team_Damage'], ['asc', 'desc', 'desc'])
+        : _.orderBy(rows, ['Team_Kills', 'Team_Damage'], ['desc', 'desc']).map((r, i) => ({...r, Computed_Rank: i + 1}));
+
+      return rows;
+    }
+
+    function computeAwards(players) {
+      const metrics = [
+        { key: 'killNum', label: 'Top Fragger' },
+        { key: 'damage', label: 'Highest Damage' },
+        { key: 'headShotNum', label: 'Most Headshots' },
+        { key: 'assists', label: 'Most Assists' },
+        { key: 'knockouts', label: 'Most Knocks' },
+        { key: 'maxKillDistance', label: 'Longest Kill' },
+        { key: 'rescueTimes', label: 'Clutch Revives' },
+        { key: 'useFragGrenadeNum', label: 'Utility Master (Frags)' },
+        { key: 'useSmokeGrenadeNum', label: 'Utility Master (Smokes)' },
+        { key: 'driveDistance', label: 'Marathon Driver' },
+        { key: 'marchDistance', label: 'Marathon Walker' },
+        { key: 'outsideBlueCircleTime', label: 'Blue Tank' },
+      ];
+
+      const awards = [];
+
+      metrics.forEach(m => {
+        const col = m.key;
+        const available = players.some(p => p[col] !== undefined);
+        if (!available) return;
+        const maxVal = _.max(players.map(p => Number(p[col] ?? 0)));
+        const winners = players.filter(p => Number(p[col] ?? 0) === maxVal);
+        winners.forEach(w => awards.push({
+          Award: m.label,
+          Value: maxVal,
+          Player: w.playerName || 'Unknown',
+          Team: w.teamName || '',
+          Kills: w.killNum ?? 0,
+          Damage: w.damage ?? 0,
+        }));
+      });
+
+      return awards;
+    }
+
+    function computeMVP(players) {
+      // Damage 60% + Kills 30% + Headshots 5% + Survival 5%
+      const cols = ['damage', 'killNum', 'headShotNum', 'survivalTime'];
+      const max = Object.fromEntries(cols.map(c => [c, _.max(players.map(p => Number(p[c] ?? 0))) || 0]));
+
+      const scored = players.map(p => {
+        const s = (
+          0.6 * (Number(p.damage || 0) / (max.damage || 1)) +
+          0.3 * (Number(p.killNum || 0) / (max.killNum || 1)) +
+          0.05 * (Number(p.headShotNum || 0) / (max.headShotNum || 1)) +
+          0.05 * (Number(p.survivalTime || 0) / (max.survivalTime || 1))
+        );
+        return { ...p, _score: s };
+      });
+      const best = _.maxBy(scored, '_score');
+      if (!best) return null;
+      return {
+        playerName: best.playerName || 'Unknown',
+        teamName: best.teamName || '',
+        killNum: best.killNum || 0,
+        damage: best.damage || 0,
+        headShotNum: best.headShotNum || 0,
+        survivalTime: best.survivalTime || 0,
+        score: Number(best._score.toFixed(3)),
+      };
+    }
+
+    // ---------- UI Components ----------
+    function DropArea({ onData }) {
+      const ref = React.useRef(null);
+      const onFiles = async (files) => {
+        try {
+          const file = files?.[0];
+          if (!file) return;
+          const text = await readFileAsText(file);
+          const json = JSON.parse(text);
+          onData(json, file.name);
+        } catch (e) {
+          alert('Could not read JSON');
+          console.error(e);
+        }
+      };
+
+      React.useEffect(() => {
+        const el = ref.current;
+        if (!el) return;
+        const prevent = (e) => { e.preventDefault(); e.stopPropagation(); };
+        const onDrag = (e) => { prevent(e); el.classList.add('dragover'); };
+        const onLeave = (e) => { prevent(e); el.classList.remove('dragover'); };
+        const onDrop = (e) => { prevent(e); el.classList.remove('dragover'); onFiles(e.dataTransfer.files); };
+        el.addEventListener('dragenter', onDrag);
+        el.addEventListener('dragover', onDrag);
+        el.addEventListener('dragleave', onLeave);
+        el.addEventListener('drop', onDrop);
+        return () => {
+          el.removeEventListener('dragenter', onDrag);
+          el.removeEventListener('dragover', onDrag);
+          el.removeEventListener('dragleave', onLeave);
+          el.removeEventListener('drop', onDrop);
+        };
+      }, []);
+
+      return (
+        <div className="card">
+          <div ref={ref} className="dropzone">
+            <div className="text-xl font-semibold">Upload match JSON</div>
+            <div className="sub">Drag and drop the file here or choose from your device</div>
+            <label className="btn mt-2 cursor-pointer">
+              <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => onFiles(e.target.files)} />
+              Choose file
+            </label>
+          </div>
+        </div>
+      );
+    }
+
+    function Stat({ label, value }) {
+      return (
+        <div className="card flex flex-col gap-1">
+          <div className="sub">{label}</div>
+          <div className="text-2xl font-bold">{value}</div>
+        </div>
+      );
+    }
+
+    function TeamTable({ rows }) {
+      const [sort, setSort] = React.useState({ key: 'Rank', dir: 'asc' });
+      const display = React.useMemo(() => {
+               const copy = [...rows];
+        const key = sort.key;
+        const dir = sort.dir === 'asc' ? 1 : -1;
+        copy.sort((a, b) => {
+          const va = a[key] ?? 0; const vb = b[key] ?? 0;
+          if (va < vb) return -1 * dir; if (va > vb) return 1 * dir; return 0;
+        });
+        return copy;
+      }, [rows, sort]);
+
+      const header = (label, key, center=false) => (
+        <th className={`th ${center ? 'text-center' : ''}`}>
+          <button className="hover:underline" onClick={() => setSort({ key, dir: sort.dir === 'asc' ? 'desc' : 'asc' })}>{label}</button>
+        </th>
+      );
+
+      return (
+        <div className="card overflow-hidden">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="title text-xl">Team Leaderboard</h3>
+            <span className="chip">Click headers to sort</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full">
+              <thead>
+                <tr className="border-b bg-slate-50">
+                  {header('Rank', rows.some(r => r.Rank != null) ? 'Rank' : 'Computed_Rank', true)}
+                  {header('Team', 'teamName')}
+                  {header('Kills', 'Team_Kills', true)}
+                  {header('Damage', 'Team_Damage', true)}
+                  {header('Avg Survival', 'Avg_Survival_Time', true)}
+                  {header('Longest Kill', 'Longest_Kill_Distance', true)}
+                  {header('Players', 'Players', true)}
+                </tr>
+              </thead>
+              <tbody>
+                {display.map((r, i) => (
+                  <tr key={r.teamId} className={`border-b hover:bg-slate-50 ${i===0 ? 'bg-amber-50' : ''}`}>
+                    <td className="td text-center font-semibold">{r.Rank ?? r.Computed_Rank ?? ''}</td>
+                    <td className="td">{r.teamName}</td>
+                    <td className="td text-center">{fmtNum(r.Team_Kills)}</td>
+                    <td className="td text-center">{fmtNum(r.Team_Damage)}</td>
+                    <td className="td text-center">{fmtTime(r.Avg_Survival_Time)}</td>
+                    <td className="td text-center">{fmtMeters(r.Longest_Kill_Distance)}</td>
+                    <td className="td text-center">{r.Players}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function AwardsGrid({ awards }) {
+      if (!awards?.length) return null;
+      return (
+        <div className="card">
+          <h3 className="title text-xl mb-4">Individual Awards</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {awards.map((a, idx) => (
+              <div key={idx} className="rounded-xl border p-4 bg-white">
+                <div className="flex items-center justify-between">
+                  <div className="font-semibold">{a.Award}</div>
+                  <span className="chip">{(a.Award.includes('Kill') && a.Award !== 'Longest Kill') ? `${a.Value}` :
+                    a.Award.includes('Damage') ? fmtNum(a.Value) :
+                    a.Award.includes('Distance') ? fmtDistance(a.Value) :
+                    a.Award.includes('Time') || a.Award.includes('Blue') ? fmtTime(a.Value) : fmtNum(a.Value)}
+                  </span>
+                </div>
+                <div className="mt-2 text-slate-700">{a.Player} <span className="sub">{a.Team ? `• ${a.Team}` : ''}</span></div>
+                <div className="mt-2 flex gap-3 text-sm text-slate-600">
+                  {a.Kills !== undefined && <span className="chip">Kills {fmtNum(a.Kills)}</span>}
+                  {a.Damage !== undefined && <span className="chip">DMG {fmtNum(a.Damage)}</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function MVPCard({ mvp }) {
+      if (!mvp) return null;
+      return (
+        <div className="card flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-500 text-white flex items-center justify-center text-xl font-bold">MVP</div>
+            <div>
+              <div className="title text-2xl">{mvp.playerName}</div>
+              <div className="sub">{mvp.teamName}</div>
+              <div className="mt-2 flex gap-2 text-sm text-slate-700">
+                <span className="chip">Kills {fmtNum(mvp.killNum)}</span>
+                <span className="chip">DMG {fmtNum(mvp.damage)}</span>
+                <span className="chip">HS {fmtNum(mvp.headShotNum)}</span>
+                <span className="chip">Time {fmtTime(mvp.survivalTime)}</span>
+                <span className="chip">Score {mvp.score}</span>
+              </div>
+            </div>
+          </div>
+          <div>
+            <button className="btn-ghost" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Upload another file</button>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [raw, setRaw] = React.useState(null);
+      const [players, setPlayers] = React.useState([]);
+      const [fileName, setFileName] = React.useState('');
+
+      const loadJson = (json, name='') => {
+        setRaw(json);
+        setFileName(name);
+        const arr = extractPlayers(json);
+        setPlayers(arr);
+      };
+
+      const teams = React.useMemo(() => computeTeamLeaderboard(players), [players]);
+      const awards = React.useMemo(() => computeAwards(players), [players]);
+      const mvp = React.useMemo(() => computeMVP(players), [players]);
+
+      const totals = React.useMemo(() => ({
+        players: players.length,
+        teams: _.uniq(players.map(p => p.teamId ?? p.teamID ?? p.TeamId ?? 0)).length,
+        kills: _.sum(players.map(p => Number(p.killNum || 0))),
+        damage: _.sum(players.map(p => Number(p.damage || 0))),
+      }), [players]);
+
+      return (
+        <div className="max-w-6xl mx-auto px-4 py-10">
+          <header className="mb-8">
+            <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight">PUBG Match Viewer</h1>
+            <p className="text-slate-600 mt-2">Upload a JSON file and see instant leaderboards, awards, and MVP insights.</p>
+          </header>
+
+          {!players.length ? (
+            <DropArea onData={loadJson} />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                <Stat label="Players" value={fmtNum(totals.players)} />
+                <Stat label="Teams" value={fmtNum(totals.teams)} />
+                <Stat label="Total Kills" value={fmtNum(totals.kills)} />
+                <Stat label="Total Damage" value={fmtNum(totals.damage)} />
+              </div>
+
+              <div className="mb-6 flex items-center justify-between">
+                <div className="chip">{fileName || 'Loaded JSON'}</div>
+                <div className="flex gap-2">
+                  <button className="btn-ghost" onClick={() => { setPlayers([]); setRaw(null); }}>Reset</button>
+                  <button className="btn" onClick={() => navigator.clipboard.writeText(JSON.stringify(raw, null, 2))}>Copy JSON</button>
+                </div>
+              </div>
+
+              <div className="space-y-6">
+                <TeamTable rows={teams} />
+                <MVPCard mvp={mvp} />
+                <AwardsGrid awards={awards} />
+              </div>
+            </>
+          )}
+
+          <footer className="mt-14 text-center text-slate-500 text-sm">
+            Built for quick Vercel deploy. Paste this file as <code>index.html</code> in a repo and import it in Vercel.
+          </footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
