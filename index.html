@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PUBG Match Viewer</title>
+  <title>PUBG Match Viewer - Multi Match</title>
   <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -13,12 +13,10 @@
   <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    /* Soft shadows and cards */
     .card { @apply bg-white/90 backdrop-blur rounded-2xl shadow-lg p-6 border border-slate-100; }
     .title { @apply text-slate-900 font-semibold; }
     .sub { @apply text-slate-500 text-sm; }
     .chip { @apply inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs bg-slate-100 text-slate-600; }
-    .badge { @apply inline-flex items-center gap-2 rounded-xl px-3 py-2 bg-slate-800 text-white; }
     .btn { @apply inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-slate-900 text-white hover:bg-slate-700 transition; }
     .btn-ghost { @apply inline-flex items-center justify-center rounded-xl px-4 py-2 font-medium bg-white text-slate-700 border hover:bg-slate-50; }
     .th { @apply text-left text-xs font-semibold text-slate-500 uppercase tracking-wider; }
@@ -33,18 +31,12 @@
   <script type="text/babel">
     const { useMemo, useState, useEffect, useRef } = React;
 
-    // ---------- Helpers ----------
     const fmtNum = (n) => {
       if (n === null || n === undefined || Number.isNaN(n)) return "";
       const v = typeof n === 'string' ? Number(n) : n;
       return isFinite(v) ? v.toLocaleString() : '';
     };
     const fmtMeters = (m) => m ? `${Math.round(m)} m` : '';
-    const fmtDistance = (m) => {
-      if (!m && m !== 0) return '';
-      const v = Number(m);
-      return isFinite(v) ? `${Math.round(v)} m` : '';
-    };
     const fmtTime = (seconds) => {
       if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return '';
       const s = Number(seconds);
@@ -55,11 +47,7 @@
       const ss = String(dur.seconds()).padStart(2, '0');
       return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
     };
-
-    const coalesce = (obj, key, d=0) => {
-      const v = obj?.[key];
-      return v === undefined || v === null ? d : v;
-    };
+    const coalesce = (obj, key, d=0) => obj?.[key] == null ? d : obj[key];
 
     const readFileAsText = (file) => new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -68,12 +56,10 @@
       reader.readAsText(file, 'utf-8');
     });
 
-    // Try to find the player array in multiple shapes
     const extractPlayers = (json) => {
       if (!json) return [];
       if (Array.isArray(json.playerInfoList)) return json.playerInfoList;
       if (Array.isArray(json.players)) return json.players;
-      // Fallback: search any array of objects containing playerName
       for (const k of Object.keys(json)) {
         const v = json[k];
         if (Array.isArray(v) && v.length && typeof v[0] === 'object' && 'playerName' in v[0]) return v;
@@ -81,132 +67,118 @@
       return [];
     };
 
-    // ---------- Core aggregations ----------
-    function computeTeamLeaderboard(players) {
-      // Build map per team
+    function perMatchTeams(players) {
       const map = new Map();
       players.forEach(p => {
         const teamId = p.teamId ?? p.teamID ?? p.TeamId ?? p.team_id ?? 0;
         const teamName = p.teamName || p.TeamName || `Team ${teamId}`;
-        const rank = p.rank ?? p.Rank ?? null; // might be repeated per player
-        const rec = map.get(teamId) || {
-          teamId, teamName,
-          Rank: rank,
-          Team_Kills: 0,
-          Team_Damage: 0,
-          Survival_Secs: [],
-          Longest_Kill_Distance: 0,
-          Players: 0,
-        };
+        const rank = p.rank ?? p.Rank ?? null;
+        const rec = map.get(teamId) || { teamId, teamName, Rank: rank, Kills: 0, Damage: 0, Survival: [], Longest: 0, Players: 0 };
         rec.Rank = rec.Rank == null ? rank : Math.min(rec.Rank, rank ?? rec.Rank);
-        rec.Team_Kills += Number(coalesce(p, 'killNum', 0));
-        rec.Team_Damage += Number(coalesce(p, 'damage', 0));
-        rec.Survival_Secs.push(Number(coalesce(p, 'survivalTime', 0)));
-        rec.Longest_Kill_Distance = Math.max(rec.Longest_Kill_Distance, Number(coalesce(p, 'maxKillDistance', 0)));
+        rec.Kills += Number(coalesce(p, 'killNum', 0));
+        rec.Damage += Number(coalesce(p, 'damage', 0));
+        rec.Survival.push(Number(coalesce(p, 'survivalTime', 0)));
+        rec.Longest = Math.max(rec.Longest, Number(coalesce(p, 'maxKillDistance', 0)));
         rec.Players += 1;
         map.set(teamId, rec);
       });
-
-      let rows = Array.from(map.values()).map(r => ({
-        ...r,
-        Avg_Survival_Time: r.Survival_Secs.length ? _.mean(r.Survival_Secs) : 0,
-      }));
-
+      let rows = Array.from(map.values()).map(r => ({...r, AvgSurvival: r.Survival.length ? _.mean(r.Survival) : 0 }));
       const hasRank = rows.some(r => r.Rank != null && r.Rank !== -1);
-      rows = hasRank
-        ? _.orderBy(rows, ['Rank', 'Team_Kills', 'Team_Damage'], ['asc', 'desc', 'desc'])
-        : _.orderBy(rows, ['Team_Kills', 'Team_Damage'], ['desc', 'desc']).map((r, i) => ({...r, Computed_Rank: i + 1}));
-
+      rows = hasRank ? _.orderBy(rows, ['Rank', 'Kills', 'Damage'], ['asc', 'desc', 'desc'])
+                     : _.orderBy(rows, ['Kills', 'Damage'], ['desc', 'desc']).map((r,i)=>({...r, Computed_Rank: i+1}));
       return rows;
     }
 
-    function computeAwards(players) {
-      const metrics = [
-        { key: 'killNum', label: 'Top Fragger' },
-        { key: 'damage', label: 'Highest Damage' },
-        { key: 'headShotNum', label: 'Most Headshots' },
-        { key: 'assists', label: 'Most Assists' },
-        { key: 'knockouts', label: 'Most Knocks' },
-        { key: 'maxKillDistance', label: 'Longest Kill' },
-        { key: 'rescueTimes', label: 'Clutch Revives' },
-        { key: 'useFragGrenadeNum', label: 'Utility Master (Frags)' },
-        { key: 'useSmokeGrenadeNum', label: 'Utility Master (Smokes)' },
-        { key: 'driveDistance', label: 'Marathon Driver' },
-        { key: 'marchDistance', label: 'Marathon Walker' },
-        { key: 'outsideBlueCircleTime', label: 'Blue Tank' },
-      ];
-
-      const awards = [];
-
-      metrics.forEach(m => {
-        const col = m.key;
-        const available = players.some(p => p[col] !== undefined);
-        if (!available) return;
-        const maxVal = _.max(players.map(p => Number(p[col] ?? 0)));
-        const winners = players.filter(p => Number(p[col] ?? 0) === maxVal);
-        winners.forEach(w => awards.push({
-          Award: m.label,
-          Value: maxVal,
-          Player: w.playerName || 'Unknown',
-          Team: w.teamName || '',
-          Kills: w.killNum ?? 0,
-          Damage: w.damage ?? 0,
-        }));
+    function aggregateTeams(matches) {
+      const map = new Map();
+      matches.forEach(m => {
+        const per = perMatchTeams(m.players);
+        per.forEach(t => {
+          const id = t.teamId;
+          const rec = map.get(id) || {
+            teamId: id, teamName: t.teamName, Matches: 0, Wins: 0,
+            Total_Kills: 0, Total_Damage: 0, Survival_Secs: [], Longest_Kill_Distance: 0, Ranks: []
+          };
+          rec.teamName = t.teamName || rec.teamName;
+          rec.Matches += 1;
+          rec.Wins += (t.Rank === 1 ? 1 : 0);
+          rec.Total_Kills += t.Kills;
+          rec.Total_Damage += t.Damage;
+          rec.Survival_Secs.push(...t.Survival);
+          rec.Longest_Kill_Distance = Math.max(rec.Longest_Kill_Distance, t.Longest);
+          if (t.Rank != null) rec.Ranks.push(t.Rank);
+          map.set(id, rec);
+        });
       });
-
-      return awards;
+      let rows = Array.from(map.values()).map(r => ({
+        ...r,
+        Avg_Survival_Time: r.Survival_Secs.length ? _.mean(r.Survival_Secs) : 0,
+        Avg_Rank: r.Ranks.length ? _.mean(r.Ranks) : null,
+      }));
+      const hasAnyRank = rows.some(r => r.Avg_Rank != null);
+      rows = hasAnyRank
+        ? _.orderBy(rows, ['Wins', 'Avg_Rank', 'Total_Kills', 'Total_Damage'], ['desc', 'asc', 'desc', 'desc'])
+        : _.orderBy(rows, ['Wins', 'Total_Kills', 'Total_Damage'], ['desc', 'desc', 'desc']);
+      return rows;
     }
 
-    function computeMVP(players) {
-      // Damage 60% + Kills 30% + Headshots 5% + Survival 5%
-      const cols = ['damage', 'killNum', 'headShotNum', 'survivalTime'];
-      const max = Object.fromEntries(cols.map(c => [c, _.max(players.map(p => Number(p[c] ?? 0))) || 0]));
-
-      const scored = players.map(p => {
-        const s = (
-          0.6 * (Number(p.damage || 0) / (max.damage || 1)) +
-          0.3 * (Number(p.killNum || 0) / (max.killNum || 1)) +
-          0.05 * (Number(p.headShotNum || 0) / (max.headShotNum || 1)) +
-          0.05 * (Number(p.survivalTime || 0) / (max.survivalTime || 1))
-        );
-        return { ...p, _score: s };
+    function aggregatePlayersByTeam(matches) {
+      const teamMap = new Map();
+      const playerKey = (p) => p.uId || p.playerOpenId || p.playerKey || `${p.playerName}#${p.teamId}`;
+      matches.forEach(m => {
+        m.players.forEach(p => {
+          const tid = p.teamId ?? p.teamID ?? p.TeamId ?? 0;
+          const tname = p.teamName || `Team ${tid}`;
+          if (!teamMap.has(tid)) teamMap.set(tid, { teamId: tid, teamName: tname, players: new Map() });
+          const tm = teamMap.get(tid);
+          const pk = playerKey(p);
+          const rec = tm.players.get(pk) || {
+            playerName: p.playerName || 'Unknown', matches: 0, kills: 0, damage: 0, headshots: 0,
+            assists: 0, knocks: 0, survival: [], longest: 0
+          };
+          rec.matches += 1;
+          rec.kills += Number(coalesce(p, 'killNum', 0));
+          rec.damage += Number(coalesce(p, 'damage', 0));
+          rec.headshots += Number(coalesce(p, 'headShotNum', 0));
+          rec.assists += Number(coalesce(p, 'assists', 0));
+          rec.knocks += Number(coalesce(p, 'knockouts', 0));
+          rec.survival.push(Number(coalesce(p, 'survivalTime', 0)));
+          rec.longest = Math.max(rec.longest, Number(coalesce(p, 'maxKillDistance', 0)));
+          tm.players.set(pk, rec);
+        });
       });
-      const best = _.maxBy(scored, '_score');
-      if (!best) return null;
-      return {
-        playerName: best.playerName || 'Unknown',
-        teamName: best.teamName || '',
-        killNum: best.killNum || 0,
-        damage: best.damage || 0,
-        headShotNum: best.headShotNum || 0,
-        survivalTime: best.survivalTime || 0,
-        score: Number(best._score.toFixed(3)),
-      };
+      const result = new Map();
+      teamMap.forEach((v, tid) => {
+        const arr = Array.from(v.players.values()).map(p => ({ ...p, avgSurvival: p.survival.length ? _.mean(p.survival) : 0 }));
+        const sorted = _.orderBy(arr, ['kills', 'damage'], ['desc', 'desc']);
+        result.set(tid, { teamId: tid, teamName: v.teamName, players: sorted });
+      });
+      return result;
     }
 
-    // ---------- UI Components ----------
-    function DropArea({ onData }) {
-      const ref = React.useRef(null);
-      const onFiles = async (files) => {
+    function MultiDrop({ onData }) {
+      const ref = useRef(null);
+      const onFiles = async (fileList) => {
         try {
-          const file = files?.[0];
-          if (!file) return;
-          const text = await readFileAsText(file);
-          const json = JSON.parse(text);
-          onData(json, file.name);
+          const files = Array.from(fileList || []);
+          const parsed = [];
+          for (const f of files) {
+            const text = await readFileAsText(f);
+            const json = JSON.parse(text);
+            parsed.push({ name: f.name, players: extractPlayers(json) });
+          }
+          onData(parsed);
         } catch (e) {
-          alert('Could not read JSON');
+          alert('Could not read one of the JSON files');
           console.error(e);
         }
       };
-
-      React.useEffect(() => {
-        const el = ref.current;
-        if (!el) return;
-        const prevent = (e) => { e.preventDefault(); e.stopPropagation(); };
-        const onDrag = (e) => { prevent(e); el.classList.add('dragover'); };
-        const onLeave = (e) => { prevent(e); el.classList.remove('dragover'); };
-        const onDrop = (e) => { prevent(e); el.classList.remove('dragover'); onFiles(e.dataTransfer.files); };
+      useEffect(() => {
+        const el = ref.current; if (!el) return;
+        const prevent = e => { e.preventDefault(); e.stopPropagation(); };
+        const onDrag = e => { prevent(e); el.classList.add('dragover'); };
+        const onLeave = e => { prevent(e); el.classList.remove('dragover'); };
+        const onDrop = e => { prevent(e); el.classList.remove('dragover'); onFiles(e.dataTransfer.files); };
         el.addEventListener('dragenter', onDrag);
         el.addEventListener('dragover', onDrag);
         el.addEventListener('dragleave', onLeave);
@@ -218,78 +190,53 @@
           el.removeEventListener('drop', onDrop);
         };
       }, []);
-
       return (
         <div className="card">
           <div ref={ref} className="dropzone">
-            <div className="text-xl font-semibold">Upload match JSON</div>
-            <div className="sub">Drag and drop the file here or choose from your device</div>
+            <div className="text-xl font-semibold">Upload multiple match JSON files</div>
+            <div className="sub">Drag and drop files here or choose from your device</div>
             <label className="btn mt-2 cursor-pointer">
-              <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => onFiles(e.target.files)} />
-              Choose file
+              <input type="file" accept="application/json,.json" multiple className="hidden" onChange={(e) => onFiles(e.target.files)} />
+              Choose files
             </label>
           </div>
         </div>
       );
     }
 
-    function Stat({ label, value }) {
+    function PlayersTable({ team }) {
+      if (!team) return <div className="sub">No player data</div>;
+      const rows = team.players || [];
       return (
-        <div className="card flex flex-col gap-1">
-          <div className="sub">{label}</div>
-          <div className="text-2xl font-bold">{value}</div>
-        </div>
-      );
-    }
-
-    function TeamTable({ rows }) {
-      const [sort, setSort] = React.useState({ key: 'Rank', dir: 'asc' });
-      const display = React.useMemo(() => {
-               const copy = [...rows];
-        const key = sort.key;
-        const dir = sort.dir === 'asc' ? 1 : -1;
-        copy.sort((a, b) => {
-          const va = a[key] ?? 0; const vb = b[key] ?? 0;
-          if (va < vb) return -1 * dir; if (va > vb) return 1 * dir; return 0;
-        });
-        return copy;
-      }, [rows, sort]);
-
-      const header = (label, key, center=false) => (
-        <th className={`th ${center ? 'text-center' : ''}`}>
-          <button className="hover:underline" onClick={() => setSort({ key, dir: sort.dir === 'asc' ? 'desc' : 'asc' })}>{label}</button>
-        </th>
-      );
-
-      return (
-        <div className="card overflow-hidden">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="title text-xl">Team Leaderboard</h3>
-            <span className="chip">Click headers to sort</span>
-          </div>
+        <div>
+          <div className="mb-2 font-semibold">Players - {team.teamName}</div>
           <div className="overflow-x-auto">
-            <table className="min-w-full">
+            <table className="min-w-full text-sm">
               <thead>
-                <tr className="border-b bg-slate-50">
-                  {header('Rank', rows.some(r => r.Rank != null) ? 'Rank' : 'Computed_Rank', true)}
-                  {header('Team', 'teamName')}
-                  {header('Kills', 'Team_Kills', true)}
-                  {header('Damage', 'Team_Damage', true)}
-                  {header('Avg Survival', 'Avg_Survival_Time', true)}
-                  {header('Longest Kill', 'Longest_Kill_Distance', true)}
-                  {header('Players', 'Players', true)}
+                <tr className="border-b bg-white">
+                  <th className="th">Player</th>
+                  <th className="th text-center">Matches</th>
+                  <th className="th text-center">Kills</th>
+                  <th className="th text-center">Damage</th>
+                  <th className="th text-center">HS</th>
+                  <th className="th text-center">Assists</th>
+                  <th className="th text-center">Knocks</th>
+                  <th className="th text-center">Avg Survival</th>
+                  <th className="th text-center">Longest Kill</th>
                 </tr>
               </thead>
               <tbody>
-                {display.map((r, i) => (
-                  <tr key={r.teamId} className={`border-b hover:bg-slate-50 ${i===0 ? 'bg-amber-50' : ''}`}>
-                    <td className="td text-center font-semibold">{r.Rank ?? r.Computed_Rank ?? ''}</td>
-                    <td className="td">{r.teamName}</td>
-                    <td className="td text-center">{fmtNum(r.Team_Kills)}</td>
-                    <td className="td text-center">{fmtNum(r.Team_Damage)}</td>
-                    <td className="td text-center">{fmtTime(r.Avg_Survival_Time)}</td>
-                    <td className="td text-center">{fmtMeters(r.Longest_Kill_Distance)}</td>
-                    <td className="td text-center">{r.Players}</td>
+                {rows.map((p, idx) => (
+                  <tr key={idx} className="border-b">
+                    <td className="td">{p.playerName}</td>
+                    <td className="td text-center">{fmtNum(p.matches)}</td>
+                    <td className="td text-center">{fmtNum(p.kills)}</td>
+                    <td className="td text-center">{fmtNum(p.damage)}</td>
+                    <td className="td text-center">{fmtNum(p.headshots)}</td>
+                    <td className="td text-center">{fmtNum(p.assists)}</td>
+                    <td className="td text-center">{fmtNum(p.knocks)}</td>
+                    <td className="td text-center">{fmtTime(p.avgSurvival)}</td>
+                    <td className="td text-center">{fmtMeters(p.longest)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -299,125 +246,181 @@
       );
     }
 
-    function AwardsGrid({ awards }) {
-      if (!awards?.length) return null;
+    function TeamAggregateTable({ rows, playerMap }) {
+      const [open, setOpen] = useState(new Set());
+      const [sort, setSort] = useState({ key: 'Wins', dir: 'desc' });
+      const display = useMemo(() => {
+        const copy = [...rows];
+        const { key } = sort; const dir = sort.dir === 'asc' ? 1 : -1;
+        copy.sort((a,b) => {
+          const va = a[key] ?? 0; const vb = b[key] ?? 0;
+          if (va < vb) return -1 * dir; if (va > vb) return 1 * dir; return 0;
+        });
+        return copy;
+      }, [rows, sort]);
+      const toggle = (tid) => {
+        const s = new Set(open); s.has(tid) ? s.delete(tid) : s.add(tid); setOpen(s);
+      };
+      const header = (label, key, center=false) => (
+        <th className={f`th ${center ? 'text-center' : ''}`}>
+          <button className="hover:underline" onClick={() => setSort({ key, dir: sort.dir === 'asc' ? 'desc' : 'asc' })}>{label}</button>
+        </th>
+      );
       return (
-        <div className="card">
-          <h3 className="title text-xl mb-4">Individual Awards</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {awards.map((a, idx) => (
-              <div key={idx} className="rounded-xl border p-4 bg-white">
-                <div className="flex items-center justify-between">
-                  <div className="font-semibold">{a.Award}</div>
-                  <span className="chip">{(a.Award.includes('Kill') && a.Award !== 'Longest Kill') ? `${a.Value}` :
-                    a.Award.includes('Damage') ? fmtNum(a.Value) :
-                    a.Award.includes('Distance') ? fmtDistance(a.Value) :
-                    a.Award.includes('Time') || a.Award.includes('Blue') ? fmtTime(a.Value) : fmtNum(a.Value)}
-                  </span>
-                </div>
-                <div className="mt-2 text-slate-700">{a.Player} <span className="sub">{a.Team ? `• ${a.Team}` : ''}</span></div>
-                <div className="mt-2 flex gap-3 text-sm text-slate-600">
-                  {a.Kills !== undefined && <span className="chip">Kills {fmtNum(a.Kills)}</span>}
-                  {a.Damage !== undefined && <span className="chip">DMG {fmtNum(a.Damage)}</span>}
-                </div>
-              </div>
-            ))}
+        <div className="card overflow-hidden">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="title text-xl">Overall Team Leaderboard</h3>
+            <span className="chip">Click headers to sort - click a row to expand players</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full">
+              <thead>
+                <tr className="border-b bg-slate-50">
+                  {header('Team', 'teamName')}
+                  {header('Matches', 'Matches', true)}
+                  {header('Wins', 'Wins', true)}
+                  {header('Avg Rank', 'Avg_Rank', true)}
+                  {header('Total Kills', 'Total_Kills', true)}
+                  {header('Total Damage', 'Total_Damage', true)}
+                  {header('Avg Survival', 'Avg_Survival_Time', true)}
+                  {header('Longest Kill', 'Longest_Kill_Distance', true)}
+                </tr>
+              </thead>
+              <tbody>
+                {display.map((r) => (
+                  <React.Fragment key={r.teamId}>
+                    <tr className="border-b hover:bg-slate-50 cursor-pointer" onClick={() => toggle(r.teamId)}>
+                      <td className="td font-semibold">{r.teamName}</td>
+                      <td className="td text-center">{fmtNum(r.Matches)}</td>
+                      <td className="td text-center">{fmtNum(r.Wins)}</td>
+                      <td className="td text-center">{r.Avg_Rank != null ? r.Avg_Rank.toFixed(2) : '-'}</td>
+                      <td className="td text-center">{fmtNum(r.Total_Kills)}</td>
+                      <td className="td text-center">{fmtNum(r.Total_Damage)}</td>
+                      <td className="td text-center">{fmtTime(r.Avg_Survival_Time)}</td>
+                      <td className="td text-center">{fmtMeters(r.Longest_Kill_Distance)}</td>
+                    </tr>
+                    {open.has(r.teamId) && (
+                      <tr className="bg-slate-50/60">
+                        <td colSpan="8" className="p-4">
+                          <PlayersTable team={playerMap.get(r.teamId)} />
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       );
     }
 
-    function MVPCard({ mvp }) {
-      if (!mvp) return null;
+    function MatchesList({ matches }) {
+      if (!matches.length) return null;
       return (
-        <div className="card flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="h-16 w-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-blue-500 text-white flex items-center justify-center text-xl font-bold">MVP</div>
-            <div>
-              <div className="title text-2xl">{mvp.playerName}</div>
-              <div className="sub">{mvp.teamName}</div>
-              <div className="mt-2 flex gap-2 text-sm text-slate-700">
-                <span className="chip">Kills {fmtNum(mvp.killNum)}</span>
-                <span className="chip">DMG {fmtNum(mvp.damage)}</span>
-                <span className="chip">HS {fmtNum(mvp.headShotNum)}</span>
-                <span className="chip">Time {fmtTime(mvp.survivalTime)}</span>
-                <span className="chip">Score {mvp.score}</span>
-              </div>
-            </div>
-          </div>
-          <div>
-            <button className="btn-ghost" onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}>Upload another file</button>
+        <div className="card">
+          <h3 className="title text-xl mb-4">Matches</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {matches.map((m, idx) => {
+              const teams = perMatchTeams(m.players).slice(0,3);
+              return (
+                <div key={idx} className="rounded-xl border p-4 bg-white">
+                  <div className="font-semibold mb-2">{m.name || `Match ${idx+1}`}</div>
+                  <ol className="list-decimal ml-6 text-slate-700">
+                    {teams.map((t,i)=>(
+                      <li key={i}>{t.teamName} - Kills {fmtNum(t.Kills)} - Damage {fmtNum(t.Damage)}</li>
+                    ))}
+                  </ol>
+                </div>
+              );
+            })}
           </div>
         </div>
       );
     }
 
     function App() {
-      const [raw, setRaw] = React.useState(null);
-      const [players, setPlayers] = React.useState([]);
-      const [fileName, setFileName] = React.useState('');
+      const [matches, setMatches] = useState([]);
 
-      const loadJson = (json, name='') => {
-        setRaw(json);
-        setFileName(name);
-        const arr = extractPlayers(json);
-        setPlayers(arr);
+      const addFiles = async (fileList) => {
+        const files = Array.from(fileList || []);
+        const parsed = [];
+        for (const f of files) {
+          try {
+            const text = await readFileAsText(f);
+            const json = JSON.parse(text);
+            parsed.push({ name: f.name, players: extractPlayers(json) });
+          } catch (e) {
+            console.error('Bad file', f.name, e);
+          }
+        }
+        setMatches(prev => [...prev, ...parsed]);
       };
 
-      const teams = React.useMemo(() => computeTeamLeaderboard(players), [players]);
-      const awards = React.useMemo(() => computeAwards(players), [players]);
-      const mvp = React.useMemo(() => computeMVP(players), [players]);
+      const totals = useMemo(() => {
+        const teamIds = new Set(); const playerKeys = new Set();
+        let kills = 0, damage = 0;
+        matches.forEach(m => {
+          m.players.forEach(p => {
+            teamIds.add(p.teamId ?? p.teamID ?? p.TeamId ?? 0);
+            const pk = p.uId || p.playerOpenId || p.playerKey || `${p.playerName}#${p.teamId}`;
+            playerKeys.add(pk);
+            kills += Number(coalesce(p,'killNum',0));
+            damage += Number(coalesce(p,'damage',0));
+          });
+        });
+        return { matches: matches.length, teams: teamIds.size, players: playerKeys.size, kills, damage };
+      }, [matches]);
 
-      const totals = React.useMemo(() => ({
-        players: players.length,
-        teams: _.uniq(players.map(p => p.teamId ?? p.teamID ?? p.TeamId ?? 0)).length,
-        kills: _.sum(players.map(p => Number(p.killNum || 0))),
-        damage: _.sum(players.map(p => Number(p.damage || 0))),
-      }), [players]);
+      const teamRows = useMemo(() => aggregateTeams(matches), [matches]);
+      const playerMap = useMemo(() => aggregatePlayersByTeam(matches), [matches]);
 
       return (
         <div className="max-w-6xl mx-auto px-4 py-10">
           <header className="mb-8">
             <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight">PUBG Match Viewer</h1>
-            <p className="text-slate-600 mt-2">Upload a JSON file and see instant leaderboards, awards, and MVP insights.</p>
+            <p className="text-slate-600 mt-2">Upload multiple match JSON files. See overall team leaderboard and player stats per team.</p>
           </header>
 
-          {!players.length ? (
-            <DropArea onData={loadJson} />
+          {!matches.length ? (
+            <MultiDrop onData={(parsed) => setMatches(parsed)} />
           ) : (
             <>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-                <Stat label="Players" value={fmtNum(totals.players)} />
-                <Stat label="Teams" value={fmtNum(totals.teams)} />
-                <Stat label="Total Kills" value={fmtNum(totals.kills)} />
-                <Stat label="Total Damage" value={fmtNum(totals.damage)} />
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                <div className="card"><div className="sub">Matches</div><div className="text-2xl font-bold">{fmtNum(totals.matches)}</div></div>
+                <div className="card"><div className="sub">Teams</div><div className="text-2xl font-bold">{fmtNum(totals.teams)}</div></div>
+                <div className="card"><div className="sub">Players</div><div className="text-2xl font-bold">{fmtNum(totals.players)}</div></div>
+                <div className="card"><div className="sub">Total Kills</div><div className="text-2xl font-bold">{fmtNum(totals.kills)}</div></div>
+                <div className="card"><div className="sub">Total Damage</div><div className="text-2xl font-bold">{fmtNum(totals.damage)}</div></div>
               </div>
 
-              <div className="mb-6 flex items-center justify-between">
-                <div className="chip">{fileName || 'Loaded JSON'}</div>
+              <div className="mb-6 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="chip">Loaded files</span>
+                  <span className="sub">{matches.map(m=>m.name).join(', ')}</span>
+                </div>
                 <div className="flex gap-2">
-                  <button className="btn-ghost" onClick={() => { setPlayers([]); setRaw(null); }}>Reset</button>
-                  <button className="btn" onClick={() => navigator.clipboard.writeText(JSON.stringify(raw, null, 2))}>Copy JSON</button>
+                  <label className="btn-ghost cursor-pointer">
+                    <input type="file" accept="application/json,.json" multiple className="hidden" onChange={(e)=> addFiles(e.target.files)} />
+                    Add more
+                  </label>
+                  <button className="btn-ghost" onClick={()=>setMatches([])}>Reset</button>
                 </div>
               </div>
 
               <div className="space-y-6">
-                <TeamTable rows={teams} />
-                <MVPCard mvp={mvp} />
-                <AwardsGrid awards={awards} />
+                <TeamAggregateTable rows={teamRows} playerMap={playerMap} />
+                <MatchesList matches={matches} />
               </div>
             </>
           )}
 
-          <footer className="mt-14 text-center text-slate-500 text-sm">
-            Built for quick Vercel deploy. Paste this file as <code>index.html</code> in a repo and import it in Vercel.
-          </footer>
+          <footer className="mt-14 text-center text-slate-500 text-sm">Static - deploy to Vercel as index.html</footer>
         </div>
       );
     }
 
-    const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<App />);
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
 </html>
